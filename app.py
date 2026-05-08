@@ -1,98 +1,85 @@
 import streamlit as st
 import pandas as pd
-from databricks import sql
+import requests
 from groq import Groq
 
 st.set_page_config(page_title="Data Validation Agent", layout="wide")
 st.title("🔍 Data Validation Agent — powered by Groq AI")
 
-# ── Read credentials from Streamlit secrets ────────────────────
 host = st.secrets["DATABRICKS_HOST"]
 token = st.secrets["DATABRICKS_TOKEN"]
-http_path = st.secrets["DATABRICKS_HTTP_PATH"]
 groq_key = st.secrets["GROQ_API_KEY"]
 
-# ── Helper: Connect to Databricks ──────────────────────────────
-def get_connection():
-    return sql.connect(
-        server_hostname=host.replace("https://", ""),
-        http_path=http_path,
-        access_token=token
-    )
+headers = {"Authorization": f"Bearer {token}"}
 
-# ── Helper: Get all schemas and tables automatically ───────────
+# ── Get all catalogs, schemas, tables via REST API ─────────────
 def get_all_tables():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SHOW SCHEMAS")
-    schemas = [row[0] for row in cursor.fetchall()]
-    all_tables = []
-    for schema in schemas:
-        try:
-            cursor.execute(f"SHOW TABLES IN {schema}")
-            for table in cursor.fetchall():
-                all_tables.append(f"{schema}.{table[1]}")
-        except Exception:
-            pass
-    cursor.close()
-    conn.close()
-    return all_tables
+    tables_list = []
 
-# ── Helper: Validate a single table ───────────────────────────
-def validate_table(table_name):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # Row count
-    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-    row_count = cursor.fetchone()[0]
-
-    # Column names + sample data
-    cursor.execute(f"SELECT * FROM {table_name} LIMIT 5")
-    columns = [desc[0] for desc in cursor.description]
-    sample = cursor.fetchall()
-
-    # Null count per column
-    null_counts = {}
-    for col in columns:
-        cursor.execute(
-            f"SELECT COUNT(*) FROM {table_name} WHERE `{col}` IS NULL"
-        )
-        null_counts[col] = cursor.fetchone()[0]
-
-    # Duplicate rows
-    cursor.execute(
-        f"SELECT COUNT(*) - COUNT(DISTINCT *) FROM {table_name}"
+    # Get catalogs
+    resp = requests.get(
+        f"{host}/api/2.1/unity-catalog/catalogs",
+        headers=headers
     )
-    duplicates = cursor.fetchone()[0]
+    if resp.status_code != 200:
+        raise Exception(f"Cannot fetch catalogs: {resp.text}")
 
-    cursor.close()
-    conn.close()
+    catalogs = [c["name"] for c in resp.json().get("catalogs", [])]
 
-    return {
-        "table": table_name,
-        "row_count": row_count,
-        "columns": columns,
-        "null_counts": null_counts,
-        "duplicate_rows": duplicates,
-        "sample": sample
-    }
+    for catalog in catalogs:
+        # Get schemas
+        resp = requests.get(
+            f"{host}/api/2.1/unity-catalog/schemas",
+            headers=headers,
+            params={"catalog_name": catalog}
+        )
+        if resp.status_code != 200:
+            continue
 
-# ── Helper: Ask Groq AI to analyze results ─────────────────────
-def analyze_with_groq(results):
+        schemas = [s["name"] for s in resp.json().get("schemas", [])]
+
+        for schema in schemas:
+            # Get tables
+            resp = requests.get(
+                f"{host}/api/2.1/unity-catalog/tables",
+                headers=headers,
+                params={"catalog_name": catalog, "schema_name": schema}
+            )
+            if resp.status_code != 200:
+                continue
+
+            for t in resp.json().get("tables", []):
+                tables_list.append({
+                    "full_name": t["full_name"],
+                    "table_type": t.get("table_type", ""),
+                    "catalog": catalog,
+                    "schema": schema,
+                    "table": t["name"]
+                })
+
+    return tables_list
+
+# ── Get table details via REST API ─────────────────────────────
+def get_table_details(full_name):
+    resp = requests.get(
+        f"{host}/api/2.1/unity-catalog/tables/{full_name}",
+        headers=headers
+    )
+    if resp.status_code != 200:
+        raise Exception(f"Cannot fetch table details: {resp.text}")
+    return resp.json()
+
+# ── Ask Groq AI to analyze ─────────────────────────────────────
+def analyze_with_groq(table_info):
     client = Groq(api_key=groq_key)
     prompt = f"""
-You are a data quality expert. Analyze this validation report and explain:
-1. What issues exist (nulls, duplicates, anomalies)
-2. Which columns are most problematic
-3. What action the data engineer should take
+You are a data quality expert. Analyze this table information and explain:
+1. What the table contains based on column names
+2. Any potential data quality concerns based on column types
+3. What a data engineer should watch out for
 
-Report:
-- Table: {results['table']}
-- Total rows: {results['row_count']}
-- Columns: {results['columns']}
-- Null counts per column: {results['null_counts']}
-- Duplicate rows: {results['duplicate_rows']}
+Table info:
+{table_info}
 
 Keep it under 150 words. Be clear and beginner-friendly.
 """
@@ -106,7 +93,6 @@ Keep it under 150 words. Be clear and beginner-friendly.
 # ── Main app ───────────────────────────────────────────────────
 st.markdown("---")
 
-# Auto-load tables on startup
 if "tables" not in st.session_state:
     with st.spinner("🔗 Connecting to Databricks and scanning tables..."):
         try:
@@ -118,61 +104,62 @@ if "tables" not in st.session_state:
             st.error(f"❌ Connection failed: {e}")
             st.stop()
 
-# Table selector
-st.subheader("📋 Select Tables to Validate")
-selected = st.multiselect(
-    "Choose one or more tables:",
-    options=st.session_state["tables"],
-    placeholder="Select tables here..."
-)
+if "tables" in st.session_state:
+    tables = st.session_state["tables"]
 
-# Run validation button
-if st.button("🚀 Run Validation", use_container_width=True):
-    if not selected:
-        st.warning("⚠️ Please select at least one table first.")
+    if not tables:
+        st.warning("⚠️ No tables found in your Databricks catalog.")
     else:
-        for table in selected:
-            st.subheader(f"📊 Results: {table}")
+        st.subheader("📋 Select Tables to Validate")
+        table_names = [t["full_name"] for t in tables]
+        selected = st.multiselect(
+            "Choose one or more tables:",
+            options=table_names,
+            placeholder="Select tables here..."
+        )
 
-            with st.spinner(f"Validating {table}..."):
-                try:
-                    results = validate_table(table)
+        if st.button("🚀 Run Validation", use_container_width=True):
+            if not selected:
+                st.warning("⚠️ Please select at least one table first.")
+            else:
+                for table_name in selected:
+                    st.subheader(f"📊 Results: {table_name}")
+                    with st.spinner(f"Analyzing {table_name}..."):
+                        try:
+                            details = get_table_details(table_name)
 
-                    # ── Metric cards ───────────────────────────
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Total Rows", f"{results['row_count']:,}")
-                    c2.metric("Total Columns", len(results['columns']))
-                    null_cols = sum(
-                        1 for v in results['null_counts'].values() if v > 0
-                    )
-                    c3.metric("Columns with Nulls", null_cols)
-                    c4.metric("Duplicate Rows", f"{results['duplicate_rows']:,}")
+                            columns = details.get("columns", [])
+                            col_df = pd.DataFrame([
+                                {
+                                    "Column": c["name"],
+                                    "Type": c.get("type_text", ""),
+                                    "Nullable": c.get("nullable", True)
+                                }
+                                for c in columns
+                            ])
 
-                    # ── Null counts bar chart ──────────────────
-                    st.write("**Null counts by column:**")
-                    null_df = pd.DataFrame(
-                        list(results['null_counts'].items()),
-                        columns=["Column", "Null Count"]
-                    ).sort_values("Null Count", ascending=False)
-                    st.bar_chart(null_df.set_index("Column"))
+                            c1, c2, c3 = st.columns(3)
+                            c1.metric("Total Columns", len(columns))
+                            nullable = sum(
+                                1 for c in columns if c.get("nullable", True)
+                            )
+                            c2.metric("Nullable Columns", nullable)
+                            c3.metric(
+                                "Table Type",
+                                details.get("table_type", "Unknown")
+                            )
 
-                    # ── Sample data ────────────────────────────
-                    with st.expander("👀 View sample data (first 5 rows)"):
-                        st.dataframe(
-                            pd.DataFrame(
-                                results['sample'],
-                                columns=results['columns']
-                            ),
-                            use_container_width=True
-                        )
+                            st.write("**Column details:**")
+                            st.dataframe(col_df, use_container_width=True)
 
-                    # ── Groq AI Analysis ───────────────────────
-                    st.write("**🤖 Groq AI Analysis:**")
-                    with st.spinner("Asking Groq AI..."):
-                        analysis = analyze_with_groq(results)
-                    st.info(analysis)
+                            st.write("**🤖 Groq AI Analysis:**")
+                            with st.spinner("Asking Groq AI..."):
+                                analysis = analyze_with_groq(
+                                    col_df.to_string()
+                                )
+                            st.info(analysis)
 
-                except Exception as e:
-                    st.error(f"❌ Could not validate {table}: {e}")
+                        except Exception as e:
+                            st.error(f"❌ Could not analyze {table_name}: {e}")
 
-            st.divider()
+                    st.divider()
