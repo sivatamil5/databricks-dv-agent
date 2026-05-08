@@ -7,10 +7,10 @@ st.set_page_config(page_title="Data Validation Agent", layout="wide")
 st.title("🔍 Data Validation Agent — powered by Groq AI")
 
 # ── Read credentials from Streamlit secrets ────────────────────
-host = st.secrets["https://dbc-2eebb4e7-9396.cloud.databricks.com"]
-token = st.secrets["dapi4829d7a016e2a3427936c84149089af2"]
-http_path = st.secrets["/sql/1.0/warehouses/1ce7ed1fb41a9370"]
-groq_key = st.secrets["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"]
+host = st.secrets["DATABRICKS_HOST"]
+token = st.secrets["DATABRICKS_TOKEN"]
+http_path = st.secrets["DATABRICKS_HTTP_PATH"]
+groq_key = st.secrets["GROQ_API_KEY"]
 
 # ── Helper: Connect to Databricks ──────────────────────────────
 def get_connection():
